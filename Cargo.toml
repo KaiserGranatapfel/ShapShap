@@ -1,0 +1,19 @@
+[package]
+name = "shapshap"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A tool for generating Linux kernel patches in the proper format"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+git2 = "0.18"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+regex = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
