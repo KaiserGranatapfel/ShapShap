@@ -4,12 +4,12 @@ A tool written in Rust and Assembly for generating Linux kernel patches in the p
 
 ## Features
 
-- ✅ Generates patches in the exact format required by Linux kernel maintainers
-- ✅ Follows kernel patch submission standards (plain text, proper headers, sign-off)
-- ✅ Supports single patches and patch series with numbering
-- ✅ Generates cover letters for patch series
-- ✅ Assembly-optimized operations for performance
-- ✅ Compatible with Rust for Linux kernel development requirements
+- Generates patches in the exact format required by Linux kernel maintainers
+- Follows kernel patch submission standards (plain text, proper headers, sign-off)
+- Supports single patches and patch series with numbering
+- Generates cover letters for patch series
+- Assembly-optimized operations for performance
+- Compatible with Rust for Linux kernel development requirements
 
 ## Requirements
 
@@ -41,7 +41,17 @@ Generate a patch from the latest commit (HEAD):
 shapshap patch
 ```
 
-This will create a `patch.txt` file in the current directory.
+This will create a patch file in the current directory.
+
+### Initialize Configuration
+
+Set up a configuration file with your default settings:
+
+```bash
+shapshap init
+```
+
+This creates `~/.config/shapshap/config.toml` with default settings that you can customize.
 
 ### Generate Patch from Commit Range
 
@@ -83,6 +93,40 @@ For RFC patches or other types:
 
 ```bash
 shapshap patch --prefix "RFC"
+```
+
+### Validate Patches
+
+Before sending patches, validate them:
+
+```bash
+shapshap validate path/to/patch.patch
+```
+
+### Check Commits
+
+Validate commits before generating patches:
+
+```bash
+shapshap check --range HEAD~3..HEAD
+```
+
+### Test Patch Application
+
+Test if a patch applies cleanly:
+
+```bash
+shapshap test-apply path/to/patch.patch
+```
+
+This creates a temporary branch, applies the patch, and cleans up automatically.
+
+### Show Statistics
+
+Get detailed statistics about a patch:
+
+```bash
+shapshap patch --stats
 ```
 
 ## Patch Format
