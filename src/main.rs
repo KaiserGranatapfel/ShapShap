@@ -1,12 +1,22 @@
 mod asm_utils;
+mod config;
+mod validation;
+mod patch_stats;
+
+#[cfg(test)]
+mod tests;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use colored::*;
+use config::Config;
 use git2::{Commit, DiffOptions, Repository};
+use patch_stats::PatchStats;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use validation::{PatchValidator, ValidationResult};
 
 #[derive(Parser)]
 #[command(name = "shapshap")]
@@ -24,8 +34,8 @@ enum Commands {
         #[arg(short, long)]
         range: Option<String>,
         /// Output directory for patch files
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
         /// Author name for sign-off
         #[arg(short, long)]
         author: Option<String>,
@@ -33,8 +43,8 @@ enum Commands {
         #[arg(short = 'e', long)]
         email: Option<String>,
         /// Subject prefix (default: PATCH)
-        #[arg(short = 'p', long, default_value = "PATCH")]
-        prefix: String,
+        #[arg(short = 'p', long)]
+        prefix: Option<String>,
         /// Number of patches in series (for [PATCH n/m] format)
         #[arg(short = 'n', long)]
         number: Option<usize>,
@@ -68,6 +78,45 @@ enum Commands {
         /// Skip adding Signed-off-by line
         #[arg(long)]
         no_signoff: bool,
+        /// Skip validation
+        #[arg(long)]
+        no_validate: bool,
+        /// Show statistics
+        #[arg(short = 's', long)]
+        stats: bool,
+    },
+    /// Validate a patch file
+    Validate {
+        /// Patch file to validate
+        path: PathBuf,
+        /// Show detailed output
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Check commits before generating patches
+    Check {
+        /// Git commit range to check
+        #[arg(short, long)]
+        range: Option<String>,
+    },
+    /// Initialize configuration file
+    Init {
+        /// Overwrite existing config
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Show patch statistics
+    Stats {
+        /// Patch file to analyze
+        path: PathBuf,
+    },
+    /// Apply a patch file to test it
+    TestApply {
+        /// Patch file to test
+        path: PathBuf,
+        /// Keep test branch after applying
+        #[arg(long)]
+        keep_branch: bool,
     },
 }
 
@@ -92,7 +141,22 @@ fn main() -> Result<()> {
             rfc,
             version,
             no_signoff,
+            no_validate,
+            stats,
         } => {
+            // Load config
+            let config = Config::load().unwrap_or_else(|_| Config::default());
+            
+            // Merge config with CLI args
+            let author = author.or(config.author);
+            let email = email.or(config.email);
+            let prefix = prefix.unwrap_or_else(|| {
+                config.default_prefix.unwrap_or_else(|| "PATCH".to_string())
+            });
+            let output = output.unwrap_or_else(|| {
+                config.default_output.unwrap_or_else(|| PathBuf::from("."))
+            });
+
             let repo = Repository::open(".")
                 .context("Failed to open git repository. Make sure you're in a git repo.")?;
 
@@ -109,6 +173,19 @@ fn main() -> Result<()> {
 
             // Build the effective prefix (handle --rfc and --version flags)
             let effective_prefix = build_prefix(&prefix, rfc, version);
+            // Validate commits if requested
+            if !no_validate {
+                let validator = PatchValidator::new();
+                println!("{}", "Validating commits...".bright_cyan());
+                for commit in &commits {
+                    let result = validator.validate_commit(commit);
+                    if !result.is_valid {
+                        result.print();
+                        anyhow::bail!("Commit validation failed");
+                    }
+                }
+                println!("{}", "✓ Commit validation passed".bright_green());
+            }
 
             let total_patches = total.unwrap_or(commits.len());
             let mut patch_number = number.unwrap_or(1);
@@ -188,6 +265,97 @@ fn main() -> Result<()> {
                     println!("\n✓ Successfully generated {} patch(es)", commits.len());
                 }
             }
+                println!("{} {}", "Generated:".bright_green(), filepath.display());
+
+                // Validate patch file if requested
+                if !no_validate {
+                    let validator = PatchValidator::new();
+                    if let Ok(result) = validator.validate_patch_file(&filepath) {
+                        if !result.is_valid {
+                            result.print();
+                        }
+                    }
+                }
+
+                // Show statistics if requested
+                if stats {
+                    let tree = commit.tree()?;
+                    let parent = commit.parent(0).ok();
+                    let parent_tree = parent.as_ref().and_then(|p| p.tree().ok());
+                    let mut diff_opts = DiffOptions::new();
+                    let diff = repo.diff_tree_to_tree(
+                        parent_tree.as_ref(),
+                        Some(&tree),
+                        Some(&mut diff_opts),
+                    )?;
+                    if let Ok(patch_stats) = PatchStats::from_diff(&diff) {
+                        patch_stats.print_summary();
+                    }
+                }
+
+                patch_number += 1;
+            }
+
+            println!("\n{}", format!("✓ Successfully generated {} patch(es)", commits.len()).bright_green());
+        }
+        Commands::Validate { path, verbose } => {
+            let validator = PatchValidator::new();
+            let result = validator.validate_patch_file(&path)?;
+            
+            if verbose {
+                println!("Validating: {}\n", path.display());
+            }
+            
+            result.print();
+            
+            if !result.is_valid {
+                std::process::exit(1);
+            }
+        }
+        Commands::Check { range } => {
+            let repo = Repository::open(".")
+                .context("Failed to open git repository")?;
+            
+            let commits = if let Some(range_str) = range {
+                parse_commit_range(&repo, &range_str)?
+            } else {
+                vec![get_head_commit(&repo)?]
+            };
+
+            let validator = PatchValidator::new();
+            let mut all_valid = true;
+
+            for commit in &commits {
+                println!("Checking commit: {}", commit.id());
+                let result = validator.validate_commit(commit);
+                result.print();
+                if !result.is_valid {
+                    all_valid = false;
+                }
+                println!();
+            }
+
+            if !all_valid {
+                std::process::exit(1);
+            }
+        }
+        Commands::Init { force } => {
+            let config_path = Config::config_path()?;
+            if config_path.exists() && !force {
+                eprintln!("Config file already exists at: {}", config_path.display());
+                eprintln!("Use --force to overwrite");
+                std::process::exit(1);
+            }
+            Config::init_config()?;
+        }
+        Commands::Stats { path } => {
+            // For now, we'll parse the patch file to show stats
+            // In a full implementation, we'd parse the diff section
+            println!("Statistics for: {}", path.display());
+            println!("(Full diff parsing coming soon)");
+        }
+        Commands::TestApply { path, keep_branch } => {
+            test_apply_patch(&path, keep_branch)?;
         }
     }
 
@@ -353,27 +521,13 @@ fn generate_diff(repo: &Repository, commit: &Commit) -> Result<String> {
         Some(&mut diff_opts),
     )?;
 
-    let mut output = String::new();
+    // Generate statistics
+    let stats = PatchStats::from_diff(&diff)?;
+    let mut output = stats.format_stat_line();
     
-    // Generate diff stats - collect file information
-    let mut files_info = Vec::new();
-    
-    diff.foreach(
-        &mut |delta, _| {
-            if let (Some(old_path), Some(new_path)) = (delta.old_file().path(), delta.new_file().path()) {
-                let old_path_str = old_path.to_string_lossy().to_string();
-                let new_path_str = new_path.to_string_lossy().to_string();
-                files_info.push((old_path_str, new_path_str));
-            }
-            true
-        },
-        None,
-        None,
-        None,
-    )?;
-
-    // Note: Detailed stats would require iterating through all lines
-    // For now, we'll just show file names in the diff output itself
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
 
     // Generate the actual diff
     diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
@@ -411,6 +565,65 @@ fn generate_diff(repo: &Repository, commit: &Commit) -> Result<String> {
     })?;
 
     Ok(output)
+}
+
+fn test_apply_patch(patch_path: &PathBuf, keep_branch: bool) -> Result<()> {
+    use std::process::Command;
+    
+    let repo = Repository::open(".")
+        .context("Failed to open git repository")?;
+    
+    // Get current branch
+    let head = repo.head()?;
+    let current_branch = head.shorthand().unwrap_or("HEAD");
+    
+    // Create test branch
+    let test_branch = format!("shapshap-test-apply-{}", chrono::Utc::now().timestamp());
+    
+    println!("{}", format!("Creating test branch: {}", test_branch).bright_cyan());
+    
+    // Create branch using git command
+    let status = Command::new("git")
+        .args(&["checkout", "-b", &test_branch])
+        .status()
+        .context("Failed to create test branch")?;
+    
+    if !status.success() {
+        anyhow::bail!("Failed to create test branch");
+    }
+    
+    // Try to apply patch
+    println!("{}", "Applying patch...".bright_cyan());
+    let status = Command::new("git")
+        .args(&["am", "--3way", patch_path.to_str().unwrap()])
+        .status()
+        .context("Failed to apply patch")?;
+    
+    if status.success() {
+        println!("{}", "✓ Patch applied successfully!".bright_green());
+        
+        if !keep_branch {
+            // Go back to original branch
+            Command::new("git")
+                .args(&["checkout", current_branch])
+                .status()?;
+            
+            // Delete test branch
+            Command::new("git")
+                .args(&["branch", "-D", &test_branch])
+                .status()?;
+            
+            println!("{}", format!("✓ Test branch '{}' deleted", test_branch).bright_green());
+        } else {
+            println!("{}", format!("Test branch '{}' kept for inspection", test_branch).bright_yellow());
+        }
+    } else {
+        println!("{}", "✗ Patch application failed".bright_red());
+        println!("{}", format!("Test branch '{}' kept for inspection", test_branch).bright_yellow());
+        std::process::exit(1);
+    }
+    
+    Ok(())
 }
 
 fn generate_patch_filename(commit: &Commit, number: usize, total: usize) -> String {

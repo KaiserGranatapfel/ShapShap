@@ -12,6 +12,18 @@ chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+dirs = "5.0"
+colored = "2.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[[test]]
+name = "integration"
+path = "tests/integration_test.rs"
 
 [profile.release]
 opt-level = 3
