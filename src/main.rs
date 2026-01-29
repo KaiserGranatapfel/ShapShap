@@ -14,7 +14,7 @@ use config::Config;
 use git2::{Commit, DiffOptions, Repository};
 use patch_stats::PatchStats;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use validation::{PatchValidator, ValidationResult};
 
@@ -54,6 +54,30 @@ enum Commands {
         /// Include cover letter
         #[arg(short, long)]
         cover_letter: bool,
+        /// Output patch to stdout instead of file
+        #[arg(long)]
+        stdout: bool,
+        /// Suppress informational messages (quiet mode)
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// Show what would be generated without writing files
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing patch files without prompting
+        #[arg(long)]
+        force: bool,
+        /// Custom output filename (e.g., patch.txt)
+        #[arg(short = 'f', long)]
+        filename: Option<String>,
+        /// Use RFC prefix (shorthand for --prefix "RFC PATCH")
+        #[arg(long)]
+        rfc: bool,
+        /// Patch version number (e.g., 2 for [PATCH v2])
+        #[arg(short = 'v', long = "reroll-count")]
+        version: Option<usize>,
+        /// Skip adding Signed-off-by line
+        #[arg(long)]
+        no_signoff: bool,
         /// Skip validation
         #[arg(long)]
         no_validate: bool,
@@ -109,6 +133,14 @@ fn main() -> Result<()> {
             number,
             total,
             cover_letter,
+            stdout,
+            quiet,
+            dry_run,
+            force,
+            filename,
+            rfc,
+            version,
+            no_signoff,
             no_validate,
             stats,
         } => {
@@ -139,6 +171,8 @@ fn main() -> Result<()> {
                 anyhow::bail!("No commits found");
             }
 
+            // Build the effective prefix (handle --rfc and --version flags)
+            let effective_prefix = build_prefix(&prefix, rfc, version);
             // Validate commits if requested
             if !no_validate {
                 let validator = PatchValidator::new();
@@ -156,9 +190,11 @@ fn main() -> Result<()> {
             let total_patches = total.unwrap_or(commits.len());
             let mut patch_number = number.unwrap_or(1);
 
-            // Generate cover letter if requested
-            if cover_letter {
-                generate_cover_letter(&output, &prefix, total_patches, &commits)?;
+            // Generate cover letter if requested (skip in stdout/dry-run mode)
+            if cover_letter && !stdout && !dry_run {
+                generate_cover_letter(&output, &effective_prefix, total_patches, &commits, quiet)?;
+            } else if cover_letter && dry_run && !quiet {
+                println!("[dry-run] Would generate: {}", output.join("0000-cover-letter.patch").display());
             }
 
             // Generate patch for each commit
@@ -166,21 +202,69 @@ fn main() -> Result<()> {
                 let patch_content = generate_patch(
                     &repo,
                     commit,
-                    &prefix,
+                    &effective_prefix,
                     patch_number,
                     total_patches,
                     &author,
                     &email,
+                    !no_signoff,
                 )?;
 
-                let filename = generate_patch_filename(commit, patch_number, total_patches);
-                let filepath = output.join(&filename);
+                // Determine output filename
+                let out_filename = if let Some(ref custom_name) = filename {
+                    if total_patches > 1 {
+                        // For multiple patches with custom filename, add number prefix
+                        format!("{:04}-{}", patch_number, custom_name)
+                    } else {
+                        custom_name.clone()
+                    }
+                } else {
+                    generate_patch_filename(commit, patch_number, total_patches)
+                };
+                let filepath = output.join(&out_filename);
 
-                let mut file = File::create(&filepath)
-                    .with_context(|| format!("Failed to create patch file: {}", filepath.display()))?;
-                file.write_all(patch_content.as_bytes())
-                    .with_context(|| format!("Failed to write patch file: {}", filepath.display()))?;
+                if stdout {
+                    // Output to stdout
+                    io::stdout().write_all(patch_content.as_bytes())?;
+                    if total_patches > 1 {
+                        // Add separator between patches
+                        println!("\n---\n");
+                    }
+                } else if dry_run {
+                    // Dry run - just show what would be generated
+                    if !quiet {
+                        println!("[dry-run] Would generate: {}", filepath.display());
+                        println!("[dry-run] Patch size: {} bytes", patch_content.len());
+                    }
+                } else {
+                    // Check if file exists and handle --force flag
+                    if filepath.exists() && !force {
+                        anyhow::bail!(
+                            "File already exists: {}. Use --force to overwrite.",
+                            filepath.display()
+                        );
+                    }
 
+                    let mut file = File::create(&filepath)
+                        .with_context(|| format!("Failed to create patch file: {}", filepath.display()))?;
+                    file.write_all(patch_content.as_bytes())
+                        .with_context(|| format!("Failed to write patch file: {}", filepath.display()))?;
+
+                    if !quiet {
+                        println!("Generated: {}", filepath.display());
+                    }
+                }
+
+                patch_number += 1;
+            }
+
+            if !quiet && !stdout {
+                if dry_run {
+                    println!("\n[dry-run] Would generate {} patch(es)", commits.len());
+                } else {
+                    println!("\n✓ Successfully generated {} patch(es)", commits.len());
+                }
+            }
                 println!("{} {}", "Generated:".bright_green(), filepath.display());
 
                 // Validate patch file if requested
@@ -278,6 +362,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Build the effective prefix based on flags
+fn build_prefix(base_prefix: &str, rfc: bool, version: Option<usize>) -> String {
+    let mut prefix = if rfc {
+        "RFC PATCH".to_string()
+    } else {
+        base_prefix.to_string()
+    };
+
+    if let Some(v) = version {
+        prefix = format!("{} v{}", prefix, v);
+    }
+
+    prefix
+}
+
 fn parse_commit_range<'a>(repo: &'a Repository, range: &str) -> Result<Vec<Commit<'a>>> {
     let mut commits = Vec::new();
     let mut revwalk = repo.revwalk()?;
@@ -328,6 +427,7 @@ fn generate_patch(
     total: usize,
     author: &Option<String>,
     email: &Option<String>,
+    include_signoff: bool,
 ) -> Result<String> {
     let mut patch = String::new();
 
@@ -385,20 +485,22 @@ fn generate_patch(
     patch.push_str(&diff);
     patch.push_str("\n");
 
-    // Sign-off line
-    let sign_off_name = author
-        .as_deref()
-        .or_else(|| author_sig.name())
-        .unwrap_or("Unknown");
-    let sign_off_email = email
-        .as_deref()
-        .or_else(|| author_sig.email())
-        .unwrap_or("unknown@example.com");
-    
-    patch.push_str(&format!(
-        "Signed-off-by: {} <{}>\n",
-        sign_off_name, sign_off_email
-    ));
+    // Sign-off line (optional)
+    if include_signoff {
+        let sign_off_name = author
+            .as_deref()
+            .or_else(|| author_sig.name())
+            .unwrap_or("Unknown");
+        let sign_off_email = email
+            .as_deref()
+            .or_else(|| author_sig.email())
+            .unwrap_or("unknown@example.com");
+
+        patch.push_str(&format!(
+            "Signed-off-by: {} <{}>\n",
+            sign_off_name, sign_off_email
+        ));
+    }
 
     Ok(patch)
 }
@@ -551,12 +653,13 @@ fn generate_cover_letter(
     prefix: &str,
     total: usize,
     commits: &[Commit],
+    quiet: bool,
 ) -> Result<()> {
     let mut cover = String::new();
-    
+
     cover.push_str(&format!("Subject: [{} 0/{total}] Cover letter\n\n", prefix, total = total));
     cover.push_str("This patch series includes the following changes:\n\n");
-    
+
     for (idx, commit) in commits.iter().enumerate() {
         let subject = commit
             .message()
@@ -564,16 +667,18 @@ fn generate_cover_letter(
             .unwrap_or("No subject");
         cover.push_str(&format!("{}. {}\n", idx + 1, subject));
     }
-    
+
     cover.push_str("\n---\n");
     cover.push_str("\n");
-    
+
     let filepath = output.join("0000-cover-letter.patch");
     let mut file = File::create(&filepath)
         .context("Failed to create cover letter file")?;
     file.write_all(cover.as_bytes())
         .context("Failed to write cover letter")?;
-    
-    println!("Generated: {}", filepath.display());
+
+    if !quiet {
+        println!("Generated: {}", filepath.display());
+    }
     Ok(())
 }
